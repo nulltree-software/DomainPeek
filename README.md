@@ -1,6 +1,12 @@
-# DomainPeek CLI DNS Insights
+# DomainPeek — CLI DNS Insights
 
-A command-line tool to quickly retrieve essential DNS, WHOIS, and basic Email Authentication information for a given domain using native Python libraries. Designed for MSPs and IT professionals needing to investigate domain configurations without relying on external command-line utilities like `dig` or `whois`.
+[![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+![Python Version](https://img.shields.io/badge/python-3.7%2B-blue)
+[![GitHub issues](https://img.shields.io/github/issues/nulltree-software/DomainPeek)](https://github.com/nulltree-software/DomainPeek/issues)
+![Platform](https://img.shields.io/badge/platform-windows%20%7C%20macOS%20%7C%20linux-lightgrey)
+
+**DomainPeek** is a command-line tool that retrieves essential DNS, WHOIS, and basic email authentication data for a given domain — all using native Python libraries.  
+Built for sysadmins, MSPs, and IT professionals who need to investigate domain configurations without relying on tools like `dig` or `whois`.
 
 
 ## Features
