@@ -296,9 +296,9 @@ Email Authentication (-m) Definitions:
     # This helps identify the hosting provider (often the registrar of the NS domain)
     dns_hosting_provider = "Not Found / Unable to Determine" # Default value
 
-    # Set Overridden state for cases where Nameservers include the DNS Hosting Provider but the Nameserver's Registrar is different
+    # Set state for cases where Nameservers include the DNS Hosting Provider but the Nameserver's Registrar is different
     # E.G. ns1.microsoftonline.com shows MarkMonitor Inc as the Registrar but Microsoft Azure DNS / M365 is the DNS Management Platform
-    provider_detected = False # Use a clearer flag name
+    provider_detected = False
 
     if first_nameserver:
         ns_lower = first_nameserver.lower()
