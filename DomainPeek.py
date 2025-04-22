@@ -9,7 +9,7 @@ from typing import List, Tuple, Optional, Any, Dict
 
 
 # Dictionary of common Selectors for checking DKIM Records 
-# (Add more as needed from major providers like SendGrid, Mailgun, etc.)
+# Can be extended to include major providers like SendGrid, Mailgun, etc
 COMMON_DKIM_SELECTORS = [
     "google",      # Google Workspace
     "selector1",   # Microsoft 365, others
@@ -27,6 +27,17 @@ COMMON_DKIM_SELECTORS = [
     "email",       # SendGrid? Generic?
 ]
 
+
+# Dictionary for Known DNS Provider Nameserver patterns
+KNOWN_PROVIDER_PATTERNS = {
+    "cloudflare.com":           "Cloudflare",
+    "google.com":               "Google Cloud DNS / Google Workspace",
+    "googlehosted.com":         "Google Workspace",
+    "googledomains.com":        "Google Domains",
+    "azure-dns":                "Microsoft Azure DNS",
+    "microsoftonline.com":      "Microsoft Azure DNS / M365",
+    "microsoft.com":            "Microsoft Azure DNS / M365"
+}
 
 # Helper function to safely get WHOIS data
 def get_whois_info(domain: str) -> Optional[Any]:
@@ -283,28 +294,42 @@ Email Authentication (-m) Definitions:
 
     # Get Registrar of the Nameserver's Owner Domain via WHOIS
     # This helps identify the hosting provider (often the registrar of the NS domain)
-    ns_registrar_info = "Not Found" # Initialize
+    dns_hosting_provider = "Not Found / Unable to Determine" # Default value
+
+    # Set Overridden state for cases where Nameservers include the DNS Hosting Provider but the Nameserver's Registrar is different
+    # E.G. ns1.microsoftonline.com shows MarkMonitor Inc as the Registrar but Microsoft Azure DNS / M365 is the DNS Management Platform
+    provider_detected = False # Use a clearer flag name
 
     if first_nameserver:
-        ns_owner_domain = get_registrable_domain(first_nameserver)
+        ns_lower = first_nameserver.lower()
 
-        if ns_owner_domain:
-            ns_domain_whois = get_whois_info(ns_owner_domain)
+        # Check known provider patterns using the dictionary
+        for pattern, provider_name in KNOWN_PROVIDER_PATTERNS.items():
+            if pattern in ns_lower:
+                dns_hosting_provider = provider_name # Assign the detected provider name
+                provider_detected = True
+                break # Found a match, no need to check further patterns
 
-            if ns_domain_whois:
-                ns_registrar_info = get_primary_whois_value(ns_domain_whois.get('registrar'))
-                if ns_registrar_info == "Not Found":
-                     org = get_primary_whois_value(ns_domain_whois.get('org'))
-                     if org != "Not Found":
-                          ns_registrar_info = f"Owner Org: {org} (Registrar Not Found)"
+        # If no known pattern matched, fallback to WHOIS inference
+        if not provider_detected:
+            ns_owner_domain = get_registrable_domain(first_nameserver)
+            if ns_owner_domain:
+                ns_domain_whois = get_whois_info(ns_owner_domain)
+                if ns_domain_whois:
+                    inferred_provider = get_primary_whois_value(ns_domain_whois.get('registrar'))
+                    if inferred_provider == "Not Found":
+                         org = get_primary_whois_value(ns_domain_whois.get('org'))
+                         dns_hosting_provider = f"Inferred: {org} (Org)" if org != "Not Found" else "Inferred: Registrar/Org Not Found in WHOIS"
+                    else:
+                         dns_hosting_provider = f"Inferred: {inferred_provider} (Registrar)"
+                else:
+                    dns_hosting_provider = f"Inferred: WHOIS Lookup Failed for {ns_owner_domain}"
             else:
-                ns_registrar_info = f"WHOIS Lookup Failed for {ns_owner_domain}"
-        else:
-            ns_registrar_info = f"Could not determine owner domain from '{first_nameserver}'."
+                dns_hosting_provider = "Inferred: Could not determine owner domain from NS"
     else:
-        ns_registrar_info = "Skipped (No nameserver found)."
+        dns_hosting_provider = "Skipped (No nameserver found)"
 
-    print(f"Inferred DNS Hosting Provider: {ns_registrar_info}")
+    print(f"DNS Hosting Provider: {dns_hosting_provider}")
 
     if args.mail_authentication:
         print("\n--- Email Authentication ---")
