@@ -20,17 +20,16 @@ setuptools.setup(
     # How the package will be named (e.g., pip install domain-peek-tool)
     # Use hyphens here. Cannot be the same as the module name 'domainpeek'.
     name="domain-peek-tool",
-    version="1.2",
+    version="1.3",
     author="Thegen Jackson",
-    description="Get DNS, WHOIS, and basic Email Authentication (SPF, DMARC, common DKIM Selectors) info using python-whois and dnspython.",
+    description="CLI DNS testing toolkit — WHOIS, DNS propagation, delegation trace, DNSSEC, email auth, and full diagnostics.",
     long_description=get_long_description(),
     long_description_content_type="text/markdown",
     url="https://github.com/nulltree-software/domainpeek",
     license="MIT",
 
     # Package Configuration
-    # Tells setuptools your code is in a single file named domainpeek.py
-    py_modules=["domainpeek"],
+    py_modules=["domainpeek", "dns_toolkit"],
 
     # Dependencies needed for the script to run
     install_requires=get_requirements(),

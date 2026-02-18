@@ -1,3 +1,4 @@
 tldextract
 python-whois
 dnspython
+cryptography
