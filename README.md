@@ -1,12 +1,12 @@
-# DomainPeek — CLI DNS Insights
+# DomainPeek — CLI DNS Testing Toolkit
 
 [![MIT License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![Python Version](https://img.shields.io/badge/python-3.7%2B-blue)
 [![GitHub issues](https://img.shields.io/github/issues/nulltree-software/DomainPeek)](https://github.com/nulltree-software/DomainPeek/issues)
 ![Platform](https://img.shields.io/badge/platform-windows%20%7C%20macOS%20%7C%20linux-lightgrey)
 
-**DomainPeek** is a command-line tool that retrieves essential DNS, WHOIS, and basic email authentication data for a given domain — all using native Python libraries.  
-Built for sysadmins, MSPs, and IT professionals who need to investigate domain configurations without relying on tools like `dig` or `whois`.
+**DomainPeek** is a command-line DNS testing toolkit that retrieves DNS, WHOIS, email authentication, and diagnostic data for any domain — all using native Python libraries.
+Built for sysadmins, MSPs, and IT professionals who need to investigate and troubleshoot domain configurations without relying on external tools like `dig` or `whois`.
 
 
 ## Features
@@ -16,12 +16,14 @@ Built for sysadmins, MSPs, and IT professionals who need to investigate domain c
 *   Retrieves **Domain Registrar** (The company managing the domain registration).
 *   Lists **Authoritative Nameservers** (NS Records) for the domain.
 *   Infers the **DNS Hosting Provider** by performing a WHOIS lookup on the *owner domain* of the primary nameserver.
-*   **Optional:** Checks basic **Email Authentication** records:
-    *   **DMARC** (`_dmarc` TXT record)
-    *   **SPF** (TXT record starting `v=spf1`)
-    *   **DKIM** (Attempts to find records using a list of common selectors like `google`, `selector1`, `k1`, etc.)
-*   **Bulk Checking:** Check multiple domains at once from a CSV or JSON file.
-*   **Export Results:** Export results to a `.txt`, `.json`, or `.csv` file.
+*   **Email Authentication** (`-m`): Checks DMARC, SPF, and DKIM records.
+*   **DNS Propagation** (`-p`): Compares DNS records across 8 public resolvers to identify inconsistencies.
+*   **DNS Trace** (`-t`): Traces the delegation chain from root servers to authoritative nameservers (like `dig +trace`).
+*   **Full Diagnostic** (`-d`): Runs all checks — SOA analysis, DNSSEC validation, TTL report, reverse DNS, authoritative vs recursive comparison, plus propagation, trace, and email auth.
+*   **Bulk Checking** (`-b`): Check multiple domains at once from a CSV or JSON file.
+*   **Export Results** (`-e`): Export results to a `.txt`, `.json`, or `.csv` file.
+*   **Custom Resolver** (`-r`): Override the default DNS resolver.
+*   **Local Resolver** (`-l`): Include an internal/local resolver in propagation checks.
 
 
 ## Prerequisites
@@ -82,7 +84,10 @@ Example usage: `domainpeek google.com`
 
 Including the `-m` or `--mail-authentication` flag outputs basic Email Authentication checks for SPF, DMARC and DKIM.
 
-Example usage: `domainpeek google.com -m` or `domainpeek google.com --mail-authentication`
+```bash
+domainpeek google.com -m
+domainpeek google.com --mail-authentication
+```
 
 
 ### Bulk Domain Checking (`-b`)
@@ -93,6 +98,7 @@ Check multiple domains from a file using the `-b` or `--bulk` flag. When using b
 domainpeek -b domains.csv
 domainpeek --bulk domains.json
 domainpeek -b domains.csv -m
+domainpeek -b domains.csv -d -e report.json
 ```
 
 **Supported input formats:**
@@ -126,7 +132,7 @@ Export results to a file using the `-e` or `--export` flag. The output format is
 domainpeek google.com -e results.json
 domainpeek google.com -m -e results.txt
 domainpeek -b domains.csv -e results.csv
-domainpeek -b domains.json -m -e full_report.json
+domainpeek -b domains.json -d -e full_report.json
 ```
 
 **Supported export formats:**
@@ -135,6 +141,97 @@ domainpeek -b domains.json -m -e full_report.json
 *   `.csv` — Tabular CSV with flattened fields
 
 When exporting, progress is displayed in the terminal while results are written to the file.
+
+
+### DNS Propagation (`-p`)
+
+Check how a domain's DNS records appear across 8 major public resolvers. This is useful for verifying DNS changes have propagated globally or identifying split-horizon issues.
+
+```bash
+domainpeek google.com -p
+domainpeek google.com --propagation
+```
+
+The tool queries **A**, **AAAA**, **NS**, and **MX** records against:
+*   Google (8.8.8.8)
+*   Cloudflare (1.1.1.1)
+*   Quad9 (9.9.9.9)
+*   OpenDNS (208.67.222.222)
+*   Level3 (209.244.0.3)
+*   Verisign (64.6.64.6)
+*   CleanBrowsing (185.228.168.9)
+*   AdGuard (94.140.14.14)
+
+Results are compared and a consensus status is shown for each record type (ALL AGREE or MISMATCH).
+
+
+### DNS Trace (`-t`)
+
+Trace the delegation chain from root DNS servers down through TLD servers to the authoritative nameservers, similar to `dig +trace`. Shows response times at each hop.
+
+```bash
+domainpeek google.com -t
+domainpeek google.com --trace
+```
+
+
+### Full Diagnostic (`-d`)
+
+Run a comprehensive diagnostic with a single command. This automatically enables email authentication (`-m`), propagation (`-p`), and trace (`-t`), plus additional checks:
+
+*   **SOA Record Analysis** — Primary NS, admin email, serial number, refresh/retry/expire timers.
+*   **DNSSEC Validation** — Checks for DS and DNSKEY records, verifies RRSIG presence.
+*   **TTL Report** — Reports the TTL for A, AAAA, NS, MX, SOA, and TXT records.
+*   **Reverse DNS (PTR)** — Performs PTR lookups on discovered A record IPs.
+*   **Authoritative vs Recursive** — Compares A and MX results from the authoritative nameserver against a public recursive resolver to detect mismatches.
+
+```bash
+domainpeek google.com -d
+domainpeek google.com --diagnose
+```
+
+This is the recommended mode for troubleshooting DNS issues — it tests as much of the DNS stack as possible in a single run.
+
+
+### Local Resolver (`-l`)
+
+Include an internal or local DNS server in the propagation check, allowing you to compare local results against public resolvers. Useful for diagnosing split-horizon DNS or internal caching issues.
+
+```bash
+domainpeek google.com -p -l 192.168.1.1
+domainpeek google.com -d -l 10.0.0.53
+```
+
+If `-l` is used without `-p` or `-d`, propagation mode is automatically enabled.
+
+
+### Custom Resolver (`-r`)
+
+Override the default system resolver for standard queries (basic lookup, mail auth, diagnostics). This does not affect the propagation check resolvers.
+
+```bash
+domainpeek google.com -r 1.1.1.1
+domainpeek google.com -d -r 8.8.8.8
+```
+
+
+### Combining Flags
+
+All flags can be combined freely. Some examples:
+
+```bash
+# Full diagnostic with local resolver, exported to JSON
+domainpeek google.com -d -l 192.168.1.1 -e report.json
+
+# Bulk check with propagation and mail auth
+domainpeek -b domains.csv -p -m
+
+# Trace with custom resolver
+domainpeek google.com -t -r 1.1.1.1
+
+# Everything: bulk + full diagnostic + export
+domainpeek -b domains.csv -d -e full_report.json
+```
 
 
 ### Output Explanation
@@ -152,7 +249,23 @@ If the `-m` or `--mail-authentication` flag is used, it also outputs:
 If records are found, the selector used will be displayed. If none are found using the common list, it will report that.
     * Note: This check is not exhaustive. Domains may use custom DKIM selectors that are not in the common list and therefore will not be found by this tool.
 
-When exporting to **JSON**, results are output as an array of structured objects containing all fields. When exporting to **CSV**, nested fields (nameservers, DKIM selectors, warnings) are flattened and joined with semicolons.
+When exporting to **JSON**, results are output as an array of structured objects containing all fields. When exporting to **CSV**, nested fields (nameservers, DKIM selectors, propagation data, etc.) are flattened and joined with semicolons.
+
+
+## Flag Reference
+
+| Flag | Long Form | Description |
+|------|-----------|-------------|
+| (positional) | | Domain name to check |
+| `-m` | `--mail-authentication` | Check SPF, DMARC, and DKIM records |
+| `-b FILE` | `--bulk FILE` | Bulk check domains from CSV or JSON file |
+| `-e FILE` | `--export FILE` | Export results to .txt, .json, or .csv |
+| `-p` | `--propagation` | Compare DNS across 8 public resolvers |
+| `-t` | `--trace` | Trace delegation chain from root servers |
+| `-d` | `--diagnose` | Full diagnostic (enables -m, -p, -t + SOA/DNSSEC/TTL/PTR) |
+| `-l IP` | `--local-resolver IP` | Include a local resolver in propagation checks |
+| `-r IP` | `--resolver IP` | Override default resolver for standard queries |
+
 
 ## License
 

@@ -12,9 +12,9 @@ import socket
 from typing import List, Tuple, Optional, Any, Dict
 
 
-# Dictionary of common Selectors for checking DKIM Records 
+# Dictionary of common Selectors for checking DKIM Records
 # Can be extended to include major providers like SendGrid, Mailgun, etc
-COMMON_DKIM_SELECTORS = [
+COMMON_DKIM_SELECTORS: List[str] = [
     "google",      # Google Workspace
     "selector1",   # Microsoft 365, others
     "selector2",   # Microsoft 365, others
@@ -33,7 +33,7 @@ COMMON_DKIM_SELECTORS = [
 
 
 # Dictionary for Known DNS Provider Nameserver patterns
-KNOWN_PROVIDER_PATTERNS = {
+KNOWN_PROVIDER_PATTERNS: Dict[str, str] = {
     "cloudflare.com":           "Cloudflare",
     "google.com":               "Google Cloud DNS / Google Workspace",
     "googlehosted.com":         "Google Workspace",
@@ -43,10 +43,31 @@ KNOWN_PROVIDER_PATTERNS = {
     "microsoft.com":            "Microsoft Azure DNS / M365"
 }
 
+# Public DNS Resolvers for propagation checks
+PUBLIC_RESOLVERS: Dict[str, str] = {
+    "Google": "8.8.8.8",
+    "Cloudflare": "1.1.1.1",
+    "Quad9": "9.9.9.9",
+    "OpenDNS": "208.67.222.222",
+    "Level3": "209.244.0.3",
+    "Verisign": "64.6.64.6",
+    "CleanBrowsing": "185.228.168.9",
+    "AdGuard": "94.140.14.14",
+}
+
+# Root DNS Servers for trace functionality
+ROOT_SERVERS: List[Tuple[str, str]] = [
+    ("a.root-servers.net", "198.41.0.4"),
+    ("b.root-servers.net", "199.9.14.201"),
+    ("c.root-servers.net", "192.33.4.12"),
+    ("d.root-servers.net", "199.7.91.13"),
+    ("e.root-servers.net", "192.203.230.10"),
+]
+
 # Helper function to safely get WHOIS data
 def get_whois_info(domain: str, warnings: Optional[List[str]] = None) -> Optional[Any]:
     """Performs a WHOIS lookup for the domain and handles common errors."""
-    def _warn(msg: str):
+    def _warn(msg: str) -> None:
         if warnings is not None:
             warnings.append(msg)
         else:
@@ -73,16 +94,22 @@ def get_whois_info(domain: str, warnings: Optional[List[str]] = None) -> Optiona
         return None
 
 # Helper function to get DNS records
-def get_dns_records(domain: str, record_type: str) -> Tuple[List[str], Optional[str]]:
+def get_dns_records(domain: str, record_type: str, nameserver: Optional[str] = None,
+                    timeout: float = 5.0) -> Tuple[List[str], Optional[str], Optional[int]]:
     """
     Performs a DNS lookup for the specified record type and handles common errors.
-    Returns a list of record strings and an optional error message.
+    Returns a tuple of (record strings, error message, TTL).
+    Optionally queries a specific nameserver.
     """
     records = []
     error_msg = None
+    ttl = None
     try:
         resolver = dns.resolver.Resolver()
-        # resolver.nameservers = ['8.8.8.8', '1.1.1.1']
+        if nameserver:
+            resolver.nameservers = [nameserver]
+        resolver.lifetime = timeout
+        resolver.timeout = timeout
         answer = resolver.resolve(domain, record_type, raise_on_no_answer=False) # Don't raise, check rrset
 
         if answer.rrset is None:
@@ -101,7 +128,9 @@ def get_dns_records(domain: str, record_type: str) -> Tuple[List[str], Optional[
                       error_msg = f"No {record_type} records found."
             else:
                 error_msg = f"No {record_type} records found."
-            return [], error_msg
+            return [], error_msg, None
+
+        ttl = answer.rrset.ttl
 
         # Process the found records
         for rdata in answer:
@@ -127,7 +156,7 @@ def get_dns_records(domain: str, record_type: str) -> Tuple[List[str], Optional[
     if not records and not error_msg:
          error_msg = f"No {record_type} records found (or query failed silently)."
 
-    return records, error_msg
+    return records, error_msg, ttl
 
 
 # Helper function to extract primary value from WHOIS results
@@ -150,7 +179,7 @@ def get_registrable_domain(fqdn: str, warnings: Optional[List[str]] = None) -> O
     Extracts the registrable domain (e.g., example.com, example.co.uk)
     from a fully qualified domain name (e.g., ns1.example.com) using tldextract.
     """
-    def _warn(msg: str):
+    def _warn(msg: str) -> None:
         if warnings is not None:
             warnings.append(msg)
         else:
@@ -173,7 +202,7 @@ def get_registrable_domain(fqdn: str, warnings: Optional[List[str]] = None) -> O
 # SPF check (filters TXT)
 def check_spf(domain: str) -> Tuple[Optional[str], Optional[str]]:
     """Checks for SPF record (TXT starting with 'v=spf1')."""
-    txt_records, error_msg = get_dns_records(domain, 'TXT')
+    txt_records, error_msg, _ = get_dns_records(domain, 'TXT')
     if error_msg and not txt_records:
         return None, error_msg # Return error if lookup failed entirely
 
@@ -209,7 +238,7 @@ def check_common_dkim(domain: str) -> Tuple[Dict[str, List[str]], Optional[str]]
 
     for selector in COMMON_DKIM_SELECTORS:
         dkim_domain = f"{selector}._domainkey.{domain}"
-        records, error_msg = get_dns_records(dkim_domain, 'TXT')
+        records, error_msg, _ = get_dns_records(dkim_domain, 'TXT')
 
         if records:
             found_dkim[selector] = records
@@ -286,7 +315,10 @@ def load_domains(filepath: str) -> List[str]:
 
 # --- Core Domain Check ---
 
-def check_domain(domain_input: str, check_mail: bool = False) -> Dict[str, Any]:
+def check_domain(domain_input: str, check_mail: bool = False,
+                 check_propagation: bool = False, check_trace: bool = False,
+                 check_diagnose: bool = False, local_resolver: Optional[str] = None,
+                 custom_resolver: Optional[str] = None) -> Dict[str, Any]:
     """
     Performs all checks for a single domain and returns a structured result dict.
     Does not print anything to stdout.
@@ -302,6 +334,9 @@ def check_domain(domain_input: str, check_mail: bool = False) -> Dict[str, Any]:
         "nameserver_error": None,
         "dns_hosting_provider": "Not Found / Unable to Determine",
         "mail_authentication": None,
+        "propagation": None,
+        "trace": None,
+        "diagnostics": None,
         "warnings": warn_list,
     }
 
@@ -328,7 +363,7 @@ def check_domain(domain_input: str, check_mail: bool = False) -> Dict[str, Any]:
         result["registrar"] = "WHOIS Lookup Failed"
 
     # Get Nameservers (NS Records) via DNS
-    nameservers, ns_error_msg = get_dns_records(domain_to_check, 'NS')
+    nameservers, ns_error_msg, _ = get_dns_records(domain_to_check, 'NS', nameserver=custom_resolver)
 
     first_nameserver = None
     if ns_error_msg:
@@ -374,7 +409,7 @@ def check_domain(domain_input: str, check_mail: bool = False) -> Dict[str, Any]:
     if check_mail:
         # DMARC
         dmarc_domain = f"_dmarc.{domain_to_check}"
-        dmarc_records, dmarc_error = get_dns_records(dmarc_domain, 'TXT')
+        dmarc_records, dmarc_error, _ = get_dns_records(dmarc_domain, 'TXT', nameserver=custom_resolver)
         dmarc_result = {"record": None, "error": None}
         if dmarc_error and not dmarc_records:
             dmarc_result["error"] = dmarc_error
@@ -394,6 +429,41 @@ def check_domain(domain_input: str, check_mail: bool = False) -> Dict[str, Any]:
             "spf": spf_result,
             "dkim": dkim_result,
         }
+
+    # DNS Toolkit checks (imported from dns_toolkit)
+    if check_propagation:
+        try:
+            from dns_toolkit import run_propagation_check
+            result["propagation"] = run_propagation_check(domain_to_check, local_resolver=local_resolver)
+        except Exception as e:
+            warn_list.append(f"Warning: Propagation check failed: {e}")
+
+    if check_trace:
+        try:
+            from dns_toolkit import dns_trace
+            result["trace"] = dns_trace(domain_to_check)
+        except Exception as e:
+            warn_list.append(f"Warning: DNS trace failed: {e}")
+
+    if check_diagnose:
+        try:
+            from dns_toolkit import run_full_diagnostic
+            first_ns_ip = None
+            if first_nameserver:
+                # Resolve the authoritative NS to an IP for direct queries
+                try:
+                    ns_ips, _, _ = get_dns_records(first_nameserver, 'A')
+                    if ns_ips:
+                        first_ns_ip = ns_ips[0]
+                except Exception:
+                    pass
+            result["diagnostics"] = run_full_diagnostic(
+                domain_to_check,
+                authoritative_ns=first_ns_ip,
+                custom_resolver=custom_resolver,
+            )
+        except Exception as e:
+            warn_list.append(f"Warning: Diagnostic checks failed: {e}")
 
     return result
 
@@ -453,7 +523,181 @@ def format_text_result(result: Dict[str, Any]) -> str:
             lines.append("\nDKIM: \nNo records found using common selectors.")
         lines.append("\n(Note: This only checks common selectors, others may exist.)")
 
+    # Diagnostics section (SOA, DNSSEC, TTL, PTR, auth-vs-recursive)
+    diag = result.get("diagnostics")
+    if diag:
+        lines.append("\n--- Full DNS Diagnostic ---")
+        lines.append(format_diagnostics_text(diag))
+
+    # Propagation section
+    prop = result.get("propagation")
+    if prop:
+        lines.append(format_propagation_text(prop, domain))
+
+    # Trace section
+    trace = result.get("trace")
+    if trace:
+        lines.append(format_trace_text(trace, domain))
+
     lines.append(f"\n--- Check Complete for: {domain} ---")
+    return "\n".join(lines)
+
+
+def format_propagation_text(data: Dict[str, Any], domain: str) -> str:
+    """Formats propagation results as human-readable text."""
+    lines = [f"\n--- DNS Propagation Check: {domain} ---"]
+    resolvers = data.get("resolvers", {})
+    consensus = data.get("consensus", {})
+
+    for rtype in ["A", "AAAA", "NS", "MX"]:
+        lines.append(f"\nRecord Type: {rtype}")
+        for resolver_name, rdata in resolvers.items():
+            entry = rdata.get(rtype, {})
+            if entry.get("error"):
+                records_str = f"Error - {entry['error'][:60]}"
+                ttl_str = ""
+            elif entry.get("records"):
+                records_str = ", ".join(entry["records"])
+                ttl_str = f"  [TTL: {entry.get('ttl', '?')}]"
+            else:
+                records_str = "No records"
+                ttl_str = ""
+            lines.append(f"  {resolver_name:<30}: {records_str}{ttl_str}")
+
+        c = consensus.get(rtype, {})
+        if c.get("agreed"):
+            lines.append(f"  STATUS: ALL AGREE")
+        elif c.get("mismatches"):
+            diff_resolvers = ", ".join(m["resolver"] for m in c["mismatches"])
+            lines.append(f"  STATUS: MISMATCH - {diff_resolvers} differ from consensus")
+
+    summary = data.get("summary", "")
+    if summary:
+        lines.append(f"\nPropagation Summary: {summary}")
+
+    return "\n".join(lines)
+
+
+def format_trace_text(data: Dict[str, Any], domain: str) -> str:
+    """Formats DNS trace results as human-readable text."""
+    lines = [f"\n--- DNS Trace: {domain} ---"]
+
+    if data.get("error"):
+        lines.append(f"\nError: {data['error']}")
+        return "\n".join(lines)
+
+    steps = data.get("steps", [])
+    for i, step in enumerate(steps, 1):
+        level = step.get("level", "unknown").title()
+        server = step.get("server_name", "unknown")
+        ip = step.get("server_queried", "?")
+        time_ms = step.get("response_time_ms", "?")
+        aa_flag = " [AA]" if step.get("authoritative") else ""
+
+        lines.append(f"\n[{i}] {level}: {server} ({ip}){aa_flag}    {time_ms}ms")
+
+        if step.get("error"):
+            lines.append(f"    Error: {step['error']}")
+        elif step.get("answer"):
+            answers = ", ".join(step["answer"])
+            ttl = step.get("ttl", "?")
+            lines.append(f"    -> Answer: {answers} [TTL: {ttl}]")
+        elif step.get("ns_records"):
+            ns_list = ", ".join(step["ns_records"][:4])
+            if len(step["ns_records"]) > 4:
+                ns_list += "..."
+            lines.append(f"    -> Delegation: {ns_list}")
+
+    chain = data.get("delegation_chain", "")
+    total = data.get("total_time_ms", 0)
+    lines.append(f"\nChain: {chain} | Total: {total}ms")
+
+    return "\n".join(lines)
+
+
+def format_diagnostics_text(data: Dict[str, Any]) -> str:
+    """Formats diagnostic results (SOA, DNSSEC, TTL, PTR, auth-vs-recursive)."""
+    lines = []
+
+    # SOA
+    soa = data.get("soa", {})
+    if soa and not soa.get("error"):
+        from dns_toolkit import format_ttl
+        lines.append("\n=== SOA Record ===")
+        lines.append(f"  Primary NS:   {soa.get('primary_ns', 'N/A')}")
+        lines.append(f"  Admin Email:  {soa.get('admin_email', 'N/A')}")
+        lines.append(f"  Serial:       {soa.get('serial', 'N/A')}")
+        lines.append(f"  Refresh:      {format_ttl(soa['refresh']) if soa.get('refresh') else 'N/A'}")
+        lines.append(f"  Retry:        {format_ttl(soa['retry']) if soa.get('retry') else 'N/A'}")
+        lines.append(f"  Expire:       {format_ttl(soa['expire']) if soa.get('expire') else 'N/A'}")
+        lines.append(f"  Minimum TTL:  {format_ttl(soa['minimum_ttl']) if soa.get('minimum_ttl') else 'N/A'}")
+    elif soa and soa.get("error"):
+        lines.append(f"\n=== SOA Record ===\n  Error: {soa['error']}")
+
+    # DNSSEC
+    dnssec = data.get("dnssec", {})
+    if dnssec and not dnssec.get("error"):
+        lines.append("\n=== DNSSEC ===")
+        enabled = dnssec.get("enabled", False)
+        valid = dnssec.get("valid")
+        if enabled and valid:
+            lines.append("  Status: ENABLED and VALID")
+        elif enabled and valid is False:
+            lines.append("  Status: ENABLED but VALIDATION FAILED")
+        elif enabled:
+            lines.append("  Status: ENABLED (validation inconclusive)")
+        else:
+            lines.append("  Status: NOT ENABLED")
+        if dnssec.get("ds_records"):
+            for ds in dnssec["ds_records"][:2]:
+                lines.append(f"  DS: {ds[:70]}{'...' if len(ds) > 70 else ''}")
+        if dnssec.get("note"):
+            lines.append(f"  Note: {dnssec['note']}")
+    elif dnssec and dnssec.get("error"):
+        lines.append(f"\n=== DNSSEC ===\n  Error: {dnssec['error']}")
+
+    # TTL Report
+    ttl_report = data.get("ttl_report", {})
+    if isinstance(ttl_report, dict) and not ttl_report.get("error"):
+        if any(k in ttl_report for k in ["A", "AAAA", "NS", "MX", "SOA", "TXT"]):
+            lines.append("\n=== TTL Report ===")
+            for rtype in ["A", "AAAA", "NS", "MX", "SOA", "TXT"]:
+                entry = ttl_report.get(rtype, {})
+                note = entry.get("note", "N/A")
+                lines.append(f"  {rtype:<6}: {note}")
+
+    # Reverse DNS
+    rev = data.get("reverse_dns", [])
+    if rev:
+        lines.append("\n=== Reverse DNS ===")
+        for entry in rev:
+            ip = entry.get("ip", "?")
+            ptr = entry.get("ptr")
+            error = entry.get("error")
+            if ptr:
+                lines.append(f"  {ip} -> {ptr}")
+            elif error:
+                lines.append(f"  {ip} -> {error}")
+
+    # Auth vs Recursive
+    avr = data.get("auth_vs_recursive", {})
+    if avr and not avr.get("error"):
+        auth_srv = avr.get("authoritative_server", "?")
+        rec_srv = avr.get("recursive_server", "?")
+        lines.append(f"\n=== Authoritative vs Recursive ===")
+        lines.append(f"  Authoritative ({auth_srv}) vs Recursive ({rec_srv}):")
+        for rtype in ["A", "MX"]:
+            entry = avr.get(rtype, {})
+            if entry.get("match"):
+                auth_records = ", ".join(entry.get("authoritative", [])) or "none"
+                lines.append(f"  {rtype:<4}: MATCH ({auth_records})")
+            else:
+                auth_records = ", ".join(entry.get("authoritative", [])) or "none"
+                rec_records = ", ".join(entry.get("recursive", [])) or "none"
+                lines.append(f"  {rtype:<4}: MISMATCH (auth: {auth_records} | rec: {rec_records})")
+    elif avr and avr.get("error"):
+        lines.append(f"\n=== Authoritative vs Recursive ===\n  {avr['error']}")
+
     return "\n".join(lines)
 
 
@@ -465,12 +709,30 @@ def results_to_json(results: List[Dict[str, Any]]) -> str:
 def results_to_csv(results: List[Dict[str, Any]]) -> str:
     """Converts a list of domain results to CSV format with flattened fields."""
     output = io.StringIO()
+
+    # Determine which optional sections are present
+    has_mail = any(r.get('mail_authentication') for r in results)
+    has_propagation = any(r.get('propagation') for r in results)
+    has_trace = any(r.get('trace') for r in results)
+    has_diagnostics = any(r.get('diagnostics') for r in results)
+
     fieldnames = [
         'domain', 'registrant', 'registrar', 'nameservers',
         'nameserver_error', 'dns_hosting_provider',
-        'dmarc_record', 'dmarc_error', 'spf_record', 'spf_error',
-        'dkim_selectors_found', 'dkim_error', 'warnings'
     ]
+    if has_mail:
+        fieldnames.extend(['dmarc_record', 'dmarc_error', 'spf_record', 'spf_error',
+                           'dkim_selectors_found', 'dkim_error'])
+    if has_propagation:
+        fieldnames.extend(['propagation_summary', 'propagation_a_agreed',
+                           'propagation_aaaa_agreed', 'propagation_ns_agreed',
+                           'propagation_mx_agreed'])
+    if has_trace:
+        fieldnames.extend(['trace_chain', 'trace_total_ms'])
+    if has_diagnostics:
+        fieldnames.extend(['soa_serial', 'dnssec_enabled', 'dnssec_valid'])
+    fieldnames.append('warnings')
+
     writer = csv.DictWriter(output, fieldnames=fieldnames)
     writer.writeheader()
     for r in results:
@@ -483,51 +745,88 @@ def results_to_csv(results: List[Dict[str, Any]]) -> str:
             'dns_hosting_provider': r['dns_hosting_provider'],
             'warnings': '; '.join(r.get('warnings') or []),
         }
-        mail = r.get('mail_authentication')
-        if mail:
-            flat['dmarc_record'] = mail['dmarc']['record'] or ''
-            flat['dmarc_error'] = mail['dmarc']['error'] or ''
-            flat['spf_record'] = mail['spf']['record'] or ''
-            flat['spf_error'] = mail['spf']['error'] or ''
-            dkim_parts = []
-            for sel, recs in mail['dkim']['found'].items():
-                dkim_parts.append(f"{sel}={recs[0][:60]}")
-            flat['dkim_selectors_found'] = '; '.join(dkim_parts)
-            flat['dkim_error'] = mail['dkim']['error'] or ''
-        else:
-            for field in ['dmarc_record', 'dmarc_error', 'spf_record', 'spf_error',
-                          'dkim_selectors_found', 'dkim_error']:
-                flat[field] = ''
+
+        if has_mail:
+            mail = r.get('mail_authentication')
+            if mail:
+                flat['dmarc_record'] = mail['dmarc']['record'] or ''
+                flat['dmarc_error'] = mail['dmarc']['error'] or ''
+                flat['spf_record'] = mail['spf']['record'] or ''
+                flat['spf_error'] = mail['spf']['error'] or ''
+                dkim_parts = []
+                for sel, recs in mail['dkim']['found'].items():
+                    dkim_parts.append(f"{sel}={recs[0][:60]}")
+                flat['dkim_selectors_found'] = '; '.join(dkim_parts)
+                flat['dkim_error'] = mail['dkim']['error'] or ''
+            else:
+                for field in ['dmarc_record', 'dmarc_error', 'spf_record', 'spf_error',
+                              'dkim_selectors_found', 'dkim_error']:
+                    flat[field] = ''
+
+        if has_propagation:
+            prop = r.get('propagation')
+            if prop:
+                flat['propagation_summary'] = prop.get('summary', '')
+                consensus = prop.get('consensus', {})
+                for rtype in ['a', 'aaaa', 'ns', 'mx']:
+                    c = consensus.get(rtype.upper(), {})
+                    flat[f'propagation_{rtype}_agreed'] = str(c.get('agreed', ''))
+            else:
+                for field in ['propagation_summary', 'propagation_a_agreed',
+                              'propagation_aaaa_agreed', 'propagation_ns_agreed',
+                              'propagation_mx_agreed']:
+                    flat[field] = ''
+
+        if has_trace:
+            trace = r.get('trace')
+            if trace:
+                flat['trace_chain'] = trace.get('delegation_chain', '')
+                flat['trace_total_ms'] = str(trace.get('total_time_ms', ''))
+            else:
+                flat['trace_chain'] = ''
+                flat['trace_total_ms'] = ''
+
+        if has_diagnostics:
+            diag = r.get('diagnostics')
+            if diag:
+                soa = diag.get('soa', {})
+                flat['soa_serial'] = str(soa.get('serial', '')) if soa.get('serial') else ''
+                dnssec = diag.get('dnssec', {})
+                flat['dnssec_enabled'] = str(dnssec.get('enabled', ''))
+                flat['dnssec_valid'] = str(dnssec.get('valid', ''))
+            else:
+                flat['soa_serial'] = ''
+                flat['dnssec_enabled'] = ''
+                flat['dnssec_valid'] = ''
+
         writer.writerow(flat)
     return output.getvalue()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(
         description="""
+DomainPeek — CLI DNS Testing Toolkit.
+
 Get DNS and WHOIS info for a domain using Python libraries.
-Optionally check common email authentication records (SPF, DMARC, DKIM).
+Optionally check email authentication, DNS propagation, delegation
+trace, and run full diagnostics.
 
-Outputs basic info by default. Use -m for Email Authentication checks.
-Use -b to check multiple domains from a CSV or JSON file.
-Use -e to export results to a file (.txt, .json, or .csv).
+Modes:
+  (default)   Basic WHOIS + NS + DNS hosting provider
+  -m          Email Authentication (SPF, DMARC, DKIM)
+  -p          Propagation check across 8 public resolvers
+  -t          DNS delegation trace (root -> TLD -> authoritative)
+  -d          Full diagnostic (runs all of the above + SOA, DNSSEC,
+              TTL report, reverse DNS, auth vs recursive comparison)
 
-Default Output Definitions:
-  - Registrant: The person or organisation who registered the domain.
-  - Registrar: The company managing the domain's registration.
-  - Nameservers: The Authoritative DNS Servers listed for the domain.
-  - DNS Hosting Provider: The platform inferred to host the DNS Records
-    (determined by WHOIS lookup on the nameserver's owner domain).
+Bulk & Export:
+  -b FILE     Check multiple domains from a CSV or JSON file
+  -e FILE     Export results to .txt, .json, or .csv
 
-Email Authentication (-m) Definitions:
-  - DMARC: (Domain-based Message Authentication, Reporting, and Conformance)
-           A policy (TXT record at _dmarc.) telling receiving servers how
-           to handle messages failing SPF/DKIM checks (reject, quarantine, none).
-  - SPF:   (Sender Policy Framework) A TXT record listing authorised servers
-           allowed to send email on behalf of the domain. Helps prevent spoofing.
-  - DKIM:  (DomainKeys Identified Mail) A digital signature (added by sending
-           server, key published in DNS TXT at selector._domainkey.) verifying
-           message integrity and origin. Tool checks common selectors.
+Resolver Options:
+  -r IP       Override the default resolver for standard queries
+  -l IP       Include a local/internal resolver in propagation checks
 """,
         formatter_class=argparse.RawTextHelpFormatter
     )
@@ -552,7 +851,42 @@ Email Authentication (-m) Definitions:
         metavar="FILE",
         help="Export results to a file. Format is determined by extension (.txt, .json, .csv)."
     )
+    parser.add_argument(
+        "-p", "--propagation",
+        action="store_true",
+        help="Check DNS propagation across 8 public resolvers (A, AAAA, NS, MX)."
+    )
+    parser.add_argument(
+        "-t", "--trace",
+        action="store_true",
+        help="Trace DNS delegation chain from root servers to authoritative nameservers."
+    )
+    parser.add_argument(
+        "-d", "--diagnose",
+        action="store_true",
+        help="Run full diagnostic (propagation, trace, mail auth, SOA, DNSSEC, TTL, PTR)."
+    )
+    parser.add_argument(
+        "-l", "--local-resolver",
+        metavar="IP",
+        help="IP address of a local/internal DNS resolver to include in propagation checks."
+    )
+    parser.add_argument(
+        "-r", "--resolver",
+        metavar="IP",
+        help="Override the default DNS resolver for standard queries."
+    )
     args = parser.parse_args()
+
+    # Diagnose mode auto-enables propagation, trace, and mail auth
+    if args.diagnose:
+        args.propagation = True
+        args.trace = True
+        args.mail_authentication = True
+
+    # Local resolver implies propagation check
+    if args.local_resolver and not args.propagation:
+        args.propagation = True
 
     # Validate: must have either domain or --bulk, not both, not neither
     if not args.domain and not args.bulk:
@@ -566,6 +900,12 @@ Email Authentication (-m) Definitions:
             domains = load_domains(args.bulk)
         except FileNotFoundError:
             print(f"Error: File not found: {args.bulk}", file=sys.stderr)
+            sys.exit(1)
+        except PermissionError:
+            print(f"Error: Permission denied reading '{args.bulk}'.", file=sys.stderr)
+            sys.exit(1)
+        except UnicodeDecodeError:
+            print(f"Error: '{args.bulk}' is not a valid UTF-8 text file.", file=sys.stderr)
             sys.exit(1)
         except (ValueError, json.JSONDecodeError) as e:
             print(f"Error reading '{args.bulk}': {e}", file=sys.stderr)
@@ -599,7 +939,15 @@ Email Authentication (-m) Definitions:
             # Progress to stderr so it doesn't contaminate export file
             print(f"[{i+1}/{len(domains)}] Checking {domain_input}...", file=sys.stderr)
 
-        result = check_domain(domain_input, check_mail=args.mail_authentication)
+        result = check_domain(
+            domain_input,
+            check_mail=args.mail_authentication,
+            check_propagation=args.propagation,
+            check_trace=args.trace,
+            check_diagnose=args.diagnose,
+            local_resolver=args.local_resolver,
+            custom_resolver=args.resolver,
+        )
         results.append(result)
 
         # Print warnings to stderr
