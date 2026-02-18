@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import sys
+import json
+import csv
+import io
+import os
 import tldextract
 import whois
 import dns.resolver
@@ -40,26 +44,32 @@ KNOWN_PROVIDER_PATTERNS = {
 }
 
 # Helper function to safely get WHOIS data
-def get_whois_info(domain: str) -> Optional[Any]:
+def get_whois_info(domain: str, warnings: Optional[List[str]] = None) -> Optional[Any]:
     """Performs a WHOIS lookup for the domain and handles common errors."""
+    def _warn(msg: str):
+        if warnings is not None:
+            warnings.append(msg)
+        else:
+            print(msg, file=sys.stderr)
+
     try:
         # timeout parameter might not be supported by all underlying whois libs/servers
         # The default whois library might follow redirects, which can be slow.
         return whois.whois(domain)
     except whois.exceptions.UnknownTld:
-        print(f"Warning: WHOIS lookup failed for '{domain}'. Unknown TLD.")
+        _warn(f"Warning: WHOIS lookup failed for '{domain}'. Unknown TLD.")
         return None
     except whois.exceptions.WhoisCommandFailed as e:
-        print(f"Warning: WHOIS command execution failed for '{domain}': {e}")
+        _warn(f"Warning: WHOIS command execution failed for '{domain}': {e}")
         return None
     except whois.exceptions.PywhoisError as e: # General catch-all for the library
-        print(f"Warning: WHOIS lookup error for '{domain}': {e}")
+        _warn(f"Warning: WHOIS lookup error for '{domain}': {e}")
         return None
     except socket.timeout:
-        print(f"Warning: WHOIS lookup for '{domain}' timed out.")
+        _warn(f"Warning: WHOIS lookup for '{domain}' timed out.")
         return None
     except Exception as e: # Catch any other unexpected errors
-        print(f"Warning: An unexpected error occurred during WHOIS lookup for '{domain}': {e}")
+        _warn(f"Warning: An unexpected error occurred during WHOIS lookup for '{domain}': {e}")
         return None
 
 # Helper function to get DNS records
@@ -135,11 +145,17 @@ def get_primary_whois_value(data: Optional[Any]) -> str:
         return str(data) # Fallback
 
 # Extracts Registrable Domain using tldextract
-def get_registrable_domain(fqdn: str) -> Optional[str]:
+def get_registrable_domain(fqdn: str, warnings: Optional[List[str]] = None) -> Optional[str]:
     """
     Extracts the registrable domain (e.g., example.com, example.co.uk)
     from a fully qualified domain name (e.g., ns1.example.com) using tldextract.
     """
+    def _warn(msg: str):
+        if warnings is not None:
+            warnings.append(msg)
+        else:
+            print(msg, file=sys.stderr)
+
     if not fqdn:
         return None
     try:
@@ -147,10 +163,10 @@ def get_registrable_domain(fqdn: str) -> Optional[str]:
         if ext.registered_domain:
              return ext.registered_domain
         else:
-            print(f"Warning: Could not extract registrable domain from '{fqdn}'")
+            _warn(f"Warning: Could not extract registrable domain from '{fqdn}'")
             return None
     except Exception as e:
-        print(f"Error using tldextract on {fqdn}: {e}")
+        _warn(f"Error using tldextract on {fqdn}: {e}")
         return None
 
 
@@ -207,6 +223,285 @@ def check_common_dkim(domain: str) -> Tuple[Dict[str, List[str]], Optional[str]]
     return found_dkim, general_error
 
 
+# --- Input File Parsers ---
+
+def load_domains_from_csv(filepath: str) -> List[str]:
+    """
+    Reads domains from a CSV file. Expects one domain per row in the first column.
+    Skips rows that look like headers and blank rows.
+    """
+    domains = []
+    with open(filepath, 'r', newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        for i, row in enumerate(reader):
+            if not row or not row[0].strip():
+                continue
+            value = row[0].strip()
+            # Skip header row
+            if i == 0 and value.lower() in ('domain', 'domain_name', 'hostname', 'host'):
+                continue
+            domains.append(value)
+    return domains
+
+
+def load_domains_from_json(filepath: str) -> List[str]:
+    """
+    Reads domains from a JSON file.
+    Supports: array of strings ["example.com", ...]
+              or array of objects [{"domain": "example.com"}, ...]
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError("JSON file must contain an array at the top level.")
+
+    domains = []
+    for item in data:
+        if isinstance(item, str):
+            d = item.strip()
+            if d:
+                domains.append(d)
+        elif isinstance(item, dict):
+            d = item.get('domain', '').strip()
+            if d:
+                domains.append(d)
+            else:
+                raise ValueError(f"JSON object missing 'domain' key: {item}")
+        else:
+            raise ValueError(f"Unexpected item type in JSON array: {type(item).__name__}")
+    return domains
+
+
+def load_domains(filepath: str) -> List[str]:
+    """Loads domains from a CSV or JSON file based on extension."""
+    ext = os.path.splitext(filepath)[1].lower()
+    if ext == '.json':
+        return load_domains_from_json(filepath)
+    elif ext in ('.csv', '.txt', ''):
+        return load_domains_from_csv(filepath)
+    else:
+        raise ValueError(f"Unsupported input file format '{ext}'. Use .csv or .json.")
+
+
+# --- Core Domain Check ---
+
+def check_domain(domain_input: str, check_mail: bool = False) -> Dict[str, Any]:
+    """
+    Performs all checks for a single domain and returns a structured result dict.
+    Does not print anything to stdout.
+    """
+    domain_to_check = domain_input.lower().strip()
+    warn_list: List[str] = []
+
+    result: Dict[str, Any] = {
+        "domain": domain_to_check,
+        "registrant": "Not Found",
+        "registrar": "Not Found",
+        "nameservers": [],
+        "nameserver_error": None,
+        "dns_hosting_provider": "Not Found / Unable to Determine",
+        "mail_authentication": None,
+        "warnings": warn_list,
+    }
+
+    # Get Domain Registrant & Registrar via WHOIS
+    domain_whois = get_whois_info(domain_to_check, warnings=warn_list)
+
+    if domain_whois:
+        registrant_name = get_primary_whois_value(domain_whois.get('name') or domain_whois.get('registrant_name'))
+        registrant_org = get_primary_whois_value(domain_whois.get('org') or domain_whois.get('registrant_organization'))
+
+        if registrant_name != "Not Found":
+            result["registrant"] = registrant_name
+        elif registrant_org != "Not Found":
+            result["registrant"] = registrant_org
+
+        registrar = get_primary_whois_value(domain_whois.get('registrar'))
+        if registrar == "Not Found":
+            url = get_primary_whois_value(domain_whois.get('registrar_url'))
+            if url != "Not Found":
+                registrar = f"URL: {url}"
+        result["registrar"] = registrar
+    else:
+        result["registrant"] = "WHOIS Lookup Failed"
+        result["registrar"] = "WHOIS Lookup Failed"
+
+    # Get Nameservers (NS Records) via DNS
+    nameservers, ns_error_msg = get_dns_records(domain_to_check, 'NS')
+
+    first_nameserver = None
+    if ns_error_msg:
+        result["nameserver_error"] = ns_error_msg
+    elif nameservers:
+        result["nameservers"] = nameservers
+        first_nameserver = nameservers[0]
+
+    # Get DNS Hosting Provider
+    dns_hosting_provider = "Not Found / Unable to Determine"
+    provider_detected = False
+
+    if first_nameserver:
+        ns_lower = first_nameserver.lower()
+
+        for pattern, provider_name in KNOWN_PROVIDER_PATTERNS.items():
+            if pattern in ns_lower:
+                dns_hosting_provider = provider_name
+                provider_detected = True
+                break
+
+        if not provider_detected:
+            ns_owner_domain = get_registrable_domain(first_nameserver, warnings=warn_list)
+            if ns_owner_domain:
+                ns_domain_whois = get_whois_info(ns_owner_domain, warnings=warn_list)
+                if ns_domain_whois:
+                    inferred_provider = get_primary_whois_value(ns_domain_whois.get('registrar'))
+                    if inferred_provider == "Not Found":
+                        org = get_primary_whois_value(ns_domain_whois.get('org'))
+                        dns_hosting_provider = f"Inferred: {org} (Org)" if org != "Not Found" else "Inferred: Registrar/Org Not Found in WHOIS"
+                    else:
+                        dns_hosting_provider = f"Inferred: {inferred_provider} (Registrar)"
+                else:
+                    dns_hosting_provider = f"Inferred: WHOIS Lookup Failed for {ns_owner_domain}"
+            else:
+                dns_hosting_provider = "Inferred: Could not determine owner domain from NS"
+    else:
+        dns_hosting_provider = "Skipped (No nameserver found)"
+
+    result["dns_hosting_provider"] = dns_hosting_provider
+
+    # Email Authentication checks
+    if check_mail:
+        # DMARC
+        dmarc_domain = f"_dmarc.{domain_to_check}"
+        dmarc_records, dmarc_error = get_dns_records(dmarc_domain, 'TXT')
+        dmarc_result = {"record": None, "error": None}
+        if dmarc_error and not dmarc_records:
+            dmarc_result["error"] = dmarc_error
+        elif dmarc_records:
+            dmarc_result["record"] = dmarc_records[0]
+
+        # SPF
+        spf_record, spf_error = check_spf(domain_to_check)
+        spf_result = {"record": spf_record, "error": spf_error}
+
+        # DKIM
+        found_dkim, dkim_general_error = check_common_dkim(domain_to_check)
+        dkim_result = {"found": found_dkim, "error": dkim_general_error}
+
+        result["mail_authentication"] = {
+            "dmarc": dmarc_result,
+            "spf": spf_result,
+            "dkim": dkim_result,
+        }
+
+    return result
+
+
+# --- Output Formatters ---
+
+def format_text_result(result: Dict[str, Any]) -> str:
+    """Formats a single domain result as human-readable text (matches original output)."""
+    lines = []
+    domain = result["domain"]
+    lines.append(f"--- Checking Domain: {domain} ---\n")
+    lines.append(f"Domain Registrant: {result['registrant']}")
+    lines.append(f"Domain Registrar: {result['registrar']}")
+
+    if result.get("nameserver_error"):
+        lines.append(f"Error: {result['nameserver_error']}")
+    elif result.get("nameservers"):
+        lines.append(f"Nameservers: {', '.join(result['nameservers'])}")
+    else:
+        lines.append("No nameservers identified.")
+
+    lines.append(f"DNS Hosting Provider: {result['dns_hosting_provider']}")
+
+    mail = result.get("mail_authentication")
+    if mail:
+        lines.append("\n--- Email Authentication ---")
+
+        # DMARC
+        dmarc = mail["dmarc"]
+        dmarc_domain = f"_dmarc.{domain}"
+        if dmarc["error"] and not dmarc["record"]:
+            lines.append(f"\nDMARC ({dmarc_domain}): \nError - {dmarc['error']}")
+        elif dmarc["record"]:
+            lines.append(f"\nDMARC ({dmarc_domain}): \n{dmarc['record']}")
+        else:
+            lines.append(f"\nDMARC ({dmarc_domain}): \nNot Found")
+
+        # SPF
+        spf = mail["spf"]
+        if spf["error"]:
+            lines.append(f"\nSPF ({domain}): \nError - {spf['error']}")
+        elif spf["record"]:
+            lines.append(f"\nSPF ({domain}): \n{spf['record']}")
+        else:
+            lines.append(f"\nSPF ({domain}): \nNot Found")
+
+        # DKIM
+        dkim = mail["dkim"]
+        if dkim["error"]:
+            lines.append(f"\nDKIM: \n{dkim['error']}")
+        if dkim["found"]:
+            lines.append("\nDKIM:")
+            for selector, records in dkim["found"].items():
+                for record in records:
+                    lines.append(f"Selector '{selector}': {record[:80]}{'...' if len(record) > 80 else ''}")
+        elif not dkim["error"]:
+            lines.append("\nDKIM: \nNo records found using common selectors.")
+        lines.append("\n(Note: This only checks common selectors, others may exist.)")
+
+    lines.append(f"\n--- Check Complete for: {domain} ---")
+    return "\n".join(lines)
+
+
+def results_to_json(results: List[Dict[str, Any]]) -> str:
+    """Converts a list of domain results to a JSON string."""
+    return json.dumps(results, indent=2, default=str)
+
+
+def results_to_csv(results: List[Dict[str, Any]]) -> str:
+    """Converts a list of domain results to CSV format with flattened fields."""
+    output = io.StringIO()
+    fieldnames = [
+        'domain', 'registrant', 'registrar', 'nameservers',
+        'nameserver_error', 'dns_hosting_provider',
+        'dmarc_record', 'dmarc_error', 'spf_record', 'spf_error',
+        'dkim_selectors_found', 'dkim_error', 'warnings'
+    ]
+    writer = csv.DictWriter(output, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in results:
+        flat: Dict[str, str] = {
+            'domain': r['domain'],
+            'registrant': r['registrant'],
+            'registrar': r['registrar'],
+            'nameservers': '; '.join(r.get('nameservers') or []),
+            'nameserver_error': r.get('nameserver_error') or '',
+            'dns_hosting_provider': r['dns_hosting_provider'],
+            'warnings': '; '.join(r.get('warnings') or []),
+        }
+        mail = r.get('mail_authentication')
+        if mail:
+            flat['dmarc_record'] = mail['dmarc']['record'] or ''
+            flat['dmarc_error'] = mail['dmarc']['error'] or ''
+            flat['spf_record'] = mail['spf']['record'] or ''
+            flat['spf_error'] = mail['spf']['error'] or ''
+            dkim_parts = []
+            for sel, recs in mail['dkim']['found'].items():
+                dkim_parts.append(f"{sel}={recs[0][:60]}")
+            flat['dkim_selectors_found'] = '; '.join(dkim_parts)
+            flat['dkim_error'] = mail['dkim']['error'] or ''
+        else:
+            for field in ['dmarc_record', 'dmarc_error', 'spf_record', 'spf_error',
+                          'dkim_selectors_found', 'dkim_error']:
+                flat[field] = ''
+        writer.writerow(flat)
+    return output.getvalue()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="""
@@ -214,6 +509,8 @@ Get DNS and WHOIS info for a domain using Python libraries.
 Optionally check common email authentication records (SPF, DMARC, DKIM).
 
 Outputs basic info by default. Use -m for Email Authentication checks.
+Use -b to check multiple domains from a CSV or JSON file.
+Use -e to export results to a file (.txt, .json, or .csv).
 
 Default Output Definitions:
   - Registrant: The person or organisation who registered the domain.
@@ -234,133 +531,105 @@ Email Authentication (-m) Definitions:
 """,
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("domain", help="The domain name to check (e.g., example.com)")
+    parser.add_argument(
+        "domain",
+        nargs='?',
+        default=None,
+        help="The domain name to check (e.g., example.com). Not required when using --bulk."
+    )
     parser.add_argument(
         "-m", "--mail-authentication",
-        action="store_true", # Set to True if flag is present
+        action="store_true",
         help="Check for SPF, DMARC and DKIM records."
     )
+    parser.add_argument(
+        "-b", "--bulk",
+        metavar="FILE",
+        help="Path to a CSV or JSON file containing domains to check in bulk."
+    )
+    parser.add_argument(
+        "-e", "--export",
+        metavar="FILE",
+        help="Export results to a file. Format is determined by extension (.txt, .json, .csv)."
+    )
     args = parser.parse_args()
-    domain_to_check = args.domain.lower().strip() # Normalize domain
 
-    print(f"--- Checking Domain: {domain_to_check} ---\n")
+    # Validate: must have either domain or --bulk, not both, not neither
+    if not args.domain and not args.bulk:
+        parser.error("Please provide a domain name or use --bulk with a file path.")
+    if args.domain and args.bulk:
+        parser.error("Cannot use both a domain argument and --bulk. Use one or the other.")
 
-    # Get Domain Registrant & Registrar via WHOIS
-    domain_whois = get_whois_info(domain_to_check)
+    # Load domains
+    if args.bulk:
+        try:
+            domains = load_domains(args.bulk)
+        except FileNotFoundError:
+            print(f"Error: File not found: {args.bulk}", file=sys.stderr)
+            sys.exit(1)
+        except (ValueError, json.JSONDecodeError) as e:
+            print(f"Error reading '{args.bulk}': {e}", file=sys.stderr)
+            sys.exit(1)
 
-    registrant = "Not Found"
-    registrar = "Not Found"
+        if not domains:
+            print(f"Error: No domains found in '{args.bulk}'.", file=sys.stderr)
+            sys.exit(1)
 
-    if domain_whois:
-        # Try common attributes for registrant name/org
-        registrant_name = get_primary_whois_value(domain_whois.get('name') or domain_whois.get('registrant_name'))
-        registrant_org = get_primary_whois_value(domain_whois.get('org') or domain_whois.get('registrant_organization'))
-
-        if registrant_name != "Not Found":
-            registrant = registrant_name
-        elif registrant_org != "Not Found":
-             registrant = registrant_org # Use Org if name not found
-        else:
-             registrant = "Not Found" # Explicitly state if neither found
-
-        # Registrar is usually more consistent
-        registrar = get_primary_whois_value(domain_whois.get('registrar'))
-        # Fallback
-        if registrar == "Not Found":
-            url = get_primary_whois_value(domain_whois.get('registrar_url'))
-            if url != "Not Found":
-                registrar = f"URL: {url}"
-
+        print(f"Loaded {len(domains)} domain(s) from '{args.bulk}'.",
+              file=sys.stderr if args.export else sys.stdout)
     else:
-        registrant = "WHOIS Lookup Failed"
-        registrar = "WHOIS Lookup Failed"
+        domains = [args.domain]
 
-    print(f"Domain Registrant: {registrant}")
-    print(f"Domain Registrar: {registrar}")
+    # Validate export path early
+    if args.export:
+        export_ext = os.path.splitext(args.export)[1].lower()
+        if export_ext not in ('.txt', '.json', '.csv'):
+            print(f"Error: Unsupported export format '{export_ext}'. Use .txt, .json, or .csv.",
+                  file=sys.stderr)
+            sys.exit(1)
+        export_dir = os.path.dirname(args.export) or '.'
+        if not os.access(export_dir, os.W_OK):
+            print(f"Error: Cannot write to directory '{export_dir}'.", file=sys.stderr)
+            sys.exit(1)
 
-    # Get Nameservers (NS Records) via DNS
-    nameservers, ns_error_msg = get_dns_records(domain_to_check, 'NS')
+    # Process domains
+    results = []
+    for i, domain_input in enumerate(domains):
+        if args.export:
+            # Progress to stderr so it doesn't contaminate export file
+            print(f"[{i+1}/{len(domains)}] Checking {domain_input}...", file=sys.stderr)
 
-    first_nameserver = None
-    if ns_error_msg:
-        print(f"Error: {ns_error_msg}")
-    elif nameservers:
-        print(f"Nameservers: {', '.join(nameservers)}")
-        first_nameserver = nameservers[0]
-    else:
-        # Should be covered by error msg, but just in case
-        print("No nameservers identified.")
+        result = check_domain(domain_input, check_mail=args.mail_authentication)
+        results.append(result)
 
+        # Print warnings to stderr
+        for w in result.get('warnings', []):
+            print(w, file=sys.stderr)
 
-    # Get Registrar of the Nameserver's Owner Domain via WHOIS
-    # This helps identify the hosting provider (often the registrar of the NS domain)
-    dns_hosting_provider = "Not Found / Unable to Determine" # Default value
+        if not args.export:
+            # Print human-readable output to stdout (existing behavior)
+            print(format_text_result(result))
+            if i < len(domains) - 1:
+                print()  # Blank line between domains in bulk mode
 
-    # Set state for cases where Nameservers include the DNS Hosting Provider but the Nameserver's Registrar is different
-    # E.G. ns1.microsoftonline.com shows MarkMonitor Inc as the Registrar but Microsoft Azure DNS / M365 is the DNS Management Platform
-    provider_detected = False
+    # Handle export
+    if args.export:
+        export_ext = os.path.splitext(args.export)[1].lower()
+        try:
+            if export_ext == '.json':
+                content = results_to_json(results)
+            elif export_ext == '.csv':
+                content = results_to_csv(results)
+            else:  # .txt
+                content = "\n\n".join(format_text_result(r) for r in results)
 
-    if first_nameserver:
-        ns_lower = first_nameserver.lower()
+            with open(args.export, 'w', encoding='utf-8') as f:
+                f.write(content)
 
-        # Check known provider patterns using the dictionary
-        for pattern, provider_name in KNOWN_PROVIDER_PATTERNS.items():
-            if pattern in ns_lower:
-                dns_hosting_provider = provider_name # Assign the detected provider name
-                provider_detected = True
-                break # Found a match, no need to check further patterns
-
-        # If no known pattern matched, fallback to WHOIS inference
-        if not provider_detected:
-            ns_owner_domain = get_registrable_domain(first_nameserver)
-            if ns_owner_domain:
-                ns_domain_whois = get_whois_info(ns_owner_domain)
-                if ns_domain_whois:
-                    inferred_provider = get_primary_whois_value(ns_domain_whois.get('registrar'))
-                    if inferred_provider == "Not Found":
-                         org = get_primary_whois_value(ns_domain_whois.get('org'))
-                         dns_hosting_provider = f"Inferred: {org} (Org)" if org != "Not Found" else "Inferred: Registrar/Org Not Found in WHOIS"
-                    else:
-                         dns_hosting_provider = f"Inferred: {inferred_provider} (Registrar)"
-                else:
-                    dns_hosting_provider = f"Inferred: WHOIS Lookup Failed for {ns_owner_domain}"
-            else:
-                dns_hosting_provider = "Inferred: Could not determine owner domain from NS"
-    else:
-        dns_hosting_provider = "Skipped (No nameserver found)"
-
-    print(f"DNS Hosting Provider: {dns_hosting_provider}")
-
-    if args.mail_authentication:
-        print("\n--- Email Authentication ---")
-
-        # DMARC Check
-        dmarc_domain = f"_dmarc.{domain_to_check}"
-        dmarc_records, dmarc_error = get_dns_records(dmarc_domain, 'TXT')
-        if dmarc_error and not dmarc_records: print(f"\nDMARC ({dmarc_domain}): \nError - {dmarc_error}")
-        elif dmarc_records: print(f"\nDMARC ({dmarc_domain}): \n{dmarc_records[0]}") # Display first DMARC found
-        else: print(f"\nDMARC ({dmarc_domain}): \nNot Found")
-
-        # SPF Check using helper function
-        spf_record, spf_error = check_spf(domain_to_check)
-        if spf_error: print(f"\nSPF ({domain_to_check}): \nError - {spf_error}")
-        elif spf_record: print(f"\nSPF ({domain_to_check}): \n{spf_record}")
-        else: print(f"\nSPF ({domain_to_check}): \nNot Found")
-
-        # DKIM Check (Using Common Selectors)
-        found_dkim, dkim_general_error = check_common_dkim(domain_to_check)
-        if dkim_general_error:
-            print(f"\nDKIM: \n{dkim_general_error}") # Report general lookup errors if any
-        if found_dkim:
-            print("\nDKIM:")
-            for selector, records in found_dkim.items():
-                for record in records:
-                    print(f"Selector '{selector}': {record[:80]}{'...' if len(record) > 80 else ''}") # Truncate long keys
-        elif not dkim_general_error: # Only print 'not found' if there wasn't a general error
-            print("\nDKIM: \nNo records found using common selectors.")
-        print("\n(Note: This only checks common selectors, others may exist.)")
-
-    print(f"\n--- Check Complete for: {domain_to_check} ---")
+            print(f"\nResults exported to '{args.export}'.", file=sys.stderr)
+        except IOError as e:
+            print(f"Error writing to '{args.export}': {e}", file=sys.stderr)
+            sys.exit(1)
 
 if __name__ == "__main__":
     main()

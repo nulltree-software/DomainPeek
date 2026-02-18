@@ -20,7 +20,7 @@ setuptools.setup(
     # How the package will be named (e.g., pip install domain-peek-tool)
     # Use hyphens here. Cannot be the same as the module name 'domainpeek'.
     name="domain-peek-tool",
-    version="1.1",
+    version="1.2",
     author="Thegen Jackson",
     description="Get DNS, WHOIS, and basic Email Authentication (SPF, DMARC, common DKIM Selectors) info using python-whois and dnspython.",
     long_description=get_long_description(),
